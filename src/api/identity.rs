@@ -153,28 +153,6 @@ async fn _password_login(
     // Set the user_uuid here to be passed back used for event logging.
     *user_uuid = Some(user.uuid.clone());
 
-    // Check password
-    let password = data.password.as_ref().unwrap();
-    if !user.check_valid_password(password) {
-        err!(
-            "Username or password is incorrect. Try again",
-            format!("IP: {}. Username: {}.", ip.ip, username),
-            ErrorEvent {
-                event: EventType::UserFailedLogIn,
-            }
-        )
-    }
-
-    // Change the KDF Iterations
-    if user.password_iterations != CONFIG.password_iterations() {
-        user.password_iterations = CONFIG.password_iterations();
-        user.set_password(password, None, false, None);
-
-        if let Err(e) = user.save(conn).await {
-            error!("Error updating user: {:#?}", e);
-        }
-    }
-
     // Check if the user is disabled
     if !user.enabled {
         err!(
@@ -184,6 +162,56 @@ async fn _password_login(
                 event: EventType::UserFailedLogIn
             }
         )
+    }
+
+    let password = data.password.as_ref().unwrap();
+
+    // If we get an auth request, we don't check the user's password, but the access code of the auth request
+    if let Some(ref auth_request_uuid) = data.auth_request {
+        let Some(auth_request) = AuthRequest::find_by_uuid(auth_request_uuid.as_str(), conn).await else {
+            err!(
+                "Auth request not found. Try again.",
+                format!("IP: {}. Username: {}.", ip.ip, username),
+                ErrorEvent {
+                    event: EventType::UserFailedLogIn,
+                }
+            )
+        };
+
+        // Delete the request after we used it
+        auth_request.delete(conn).await?;
+
+        if auth_request.user_uuid != user.uuid
+            || !auth_request.approved.unwrap_or(false)
+            || ip.ip.to_string() != auth_request.request_ip
+            || !auth_request.check_access_code(password)
+        {
+            err!(
+                "Username or access code is incorrect. Try again",
+                format!("IP: {}. Username: {}.", ip.ip, username),
+                ErrorEvent {
+                    event: EventType::UserFailedLogIn,
+                }
+            )
+        }
+    } else if !user.check_valid_password(password) {
+        err!(
+            "Username or password is incorrect. Try again",
+            format!("IP: {}. Username: {}.", ip.ip, username),
+            ErrorEvent {
+                event: EventType::UserFailedLogIn,
+            }
+        )
+    }
+
+    // Change the KDF Iterations (only when not logging in with an auth request)
+    if data.auth_request.is_none() && user.password_iterations != CONFIG.password_iterations() {
+        user.password_iterations = CONFIG.password_iterations();
+        user.set_password(password, None, false, None);
+
+        if let Err(e) = user.save(conn).await {
+            error!("Error updating user: {:#?}", e);
+        }
     }
 
     let now = Utc::now().naive_utc();
@@ -646,6 +674,8 @@ struct ConnectData {
     #[field(name = uncased("two_factor_remember"))]
     #[field(name = uncased("twofactorremember"))]
     two_factor_remember: Option<i32>,
+    #[field(name = uncased("authrequest"))]
+    auth_request: Option<String>,
 }
 
 fn _check_is_some<T>(value: &Option<T>, msg: &str) -> EmptyResult {
